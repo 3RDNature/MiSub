@@ -7,10 +7,34 @@ import { KV_KEY_SUBS, KV_KEY_PROFILES } from '../config.js';
 import { fetchSubscriptionNodes } from './node-fetcher.js';
 
 /**
+ * 生成过期提示节点
+ * @param {string} message 提示信息
+ * @returns {Array} 节点列表
+ */
+function generateExpiredNode(message) {
+    const errorNodeName = `[提示] ${message}`;
+    // 生成一个不可用的节点用于展示信息
+    const node = {
+        name: errorNodeName,
+        type: 'vmess',
+        server: '127.0.0.1',
+        port: 80,
+        uuid: '00000000-0000-0000-0000-000000000000',
+        alterId: 0,
+        cipher: 'auto',
+        tls: false,
+        network: 'tcp',
+        subscriptionName: '系统提示',
+        url: `vmess://${btoa(JSON.stringify({ v: "2", ps: errorNodeName, add: "127.0.0.1", port: "80", id: "00000000-0000-0000-0000-000000000000", aid: "0", scy: "auto", net: "tcp", type: "none", host: "", path: "", tls: "" }))}`
+    };
+    return [node];
+}
+
+/**
  * 处理订阅组模式的节点获取
  * @param {Object} request - HTTP请求对象
  * @param {Object} env - Cloudflare环境对象
- * @param {string} profileId - 订阅组ID
+ * @param {string} profileId - 订阅组ID (可能是 ID, CustomId 或 AccessToken)
  * @param {string} userAgent - 用户代理
  * @param {boolean} applyTransform - 是否应用节点转换规则（智能重命名、前缀等）
  * @returns {Promise<Object>} 处理结果
@@ -22,11 +46,56 @@ export async function handleProfileMode(request, env, profileId, userAgent, appl
     const allProfiles = await storageAdapter.get(KV_KEY_PROFILES) || [];
     const allSubscriptions = await storageAdapter.get(KV_KEY_SUBS) || [];
 
+    // --- 核心修改：支持多 Token 匹配逻辑 ---
+    let matchedTokenConfig = null;
+
     // 查找匹配的订阅组
-    const profile = allProfiles.find(p => (p.customId && p.customId === profileId) || p.id === profileId);
+    const profile = allProfiles.find(p => {
+        // 1. 匹配原始 ID (管理员/默认链接)
+        if (p.id === profileId) return true;
+        
+        // 2. 匹配旧版 Custom ID
+        if (p.customId && p.customId === profileId) return true;
+        
+        // 3. 匹配多 Token 列表 (Access Tokens)
+        if (Array.isArray(p.accessTokens)) {
+            const tokenMatch = p.accessTokens.find(t => t.token === profileId && t.enabled !== false);
+            if (tokenMatch) {
+                matchedTokenConfig = tokenMatch;
+                return true;
+            }
+        }
+        return false;
+    });
 
     if (!profile || !profile.enabled) {
         return createJsonResponse({ error: '订阅组不存在或已禁用' }, 404);
+    }
+
+    // --- 核心修改：过期时间检查 ---
+    // 默认使用全局/旧版设置
+    let expiresAt = profile.expiresAt;
+    
+    // 如果匹配到了特定的 Token，优先使用该 Token 的过期时间
+    if (matchedTokenConfig && matchedTokenConfig.expiresAt) {
+        expiresAt = matchedTokenConfig.expiresAt;
+    }
+
+    // 执行过期检查
+    if (expiresAt) {
+        const now = new Date();
+        const expDate = new Date(expiresAt);
+        // 简单的日期比较 (如果 expiresAt 是 YYYY-MM-DD，JS 会解析为 UTC 0点，可能存在时区偏差，但通常足够)
+        if (!isNaN(expDate.getTime()) && now > expDate) {
+            const expiredNodes = generateExpiredNode(`此订阅链接已于 ${expiresAt} 到期，请联系管理员。`);
+            return {
+                success: true,
+                subscriptions: [],
+                nodes: expiredNodes,
+                totalCount: 1,
+                stats: { protocols: {}, regions: {} }
+            };
+        }
     }
 
     // Create a map for quick lookup
